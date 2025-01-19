@@ -34,8 +34,20 @@ class SSH_Tunnel_Proxy
         // AJAX handlers for status checks
         add_action('wp_ajax_test_ssh_tunnel', array($this, 'ajax_test_tunnel'));
         add_action('wp_ajax_get_tunnel_status', array($this, 'ajax_get_tunnel_status'));
+
+        add_action('http_api_curl', array($this, 'modify_curl_handle'), 10);
     }
 
+    public function modify_curl_handle($handle)
+    {
+        $url = curl_getinfo($handle, CURLINFO_EFFECTIVE_URL);
+
+        if ($this->should_route_request($url)) {
+            curl_setopt($handle, CURLOPT_PROXY, "socks5h://{$this->config['tunnel_host']}");
+            curl_setopt($handle, CURLOPT_PROXYPORT, $this->config['tunnel_port']);
+            curl_setopt($handle, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5_HOSTNAME);
+        }
+    }
     // Test if tunnel is accessible
     private function test_tunnel_connection()
     {
@@ -101,38 +113,50 @@ class SSH_Tunnel_Proxy
         ));
     }
 
+    /**
+     * Check if the request should be routed through the SSH tunnel
+     * 
+     * @param string $url The URL of the request
+     */
+    private function should_route_request($url)
+    {
+        $route_all = get_option('ssh_tunnel_route_all', false);
+        $whitelist_domains = $this->get_whitelist_domains();
+        $host = parse_url($url, PHP_URL_HOST);
+
+        return $route_all || in_array($host, $whitelist_domains);
+    }
+
     public function modify_http_request($args, $url)
     {
-        // Existing request modification code...
-        $route_all = get_option('ssh_tunnel_route_all', false);
-        $should_route = false;
-
-        if ($route_all) {
-            $should_route = true;
-        } else {
-            $whitelist_domains = $this->get_whitelist_domains();
-            $host = parse_url($url, PHP_URL_HOST);
-            $should_route = in_array($host, $whitelist_domains);
-        }
+        $should_route = $this->should_route_request($url);
 
         if ($should_route) {
-            if (!isset($args['curl_proxy'])) {
-                $args['curl_proxy'] = true;
-            }
-
-            if (!isset($args['sslcertificates'])) {
-                $args['sslcertificates'] = ABSPATH . WPINC . '/certificates/ca-bundle.crt';
-            }
-
-            if (!isset($args['curl_setopt'])) {
-                $args['curl_setopt'] = array();
+            // Check current IP before proxy
+            if ($this->config['debug_mode']) {
+                $pre_ip = file_get_contents('https://api.ipify.org?format=json');
+                error_log("[SSH Tunnel] Pre-proxy IP: " . $pre_ip);
             }
 
             $args['curl_setopt'][CURLOPT_PROXY] = "socks5h://{$this->config['tunnel_host']}";
             $args['curl_setopt'][CURLOPT_PROXYPORT] = $this->config['tunnel_port'];
+            $args['curl_setopt'][CURLOPT_PROXYTYPE] = CURLPROXY_SOCKS5_HOSTNAME;
+            $args['curl_setopt'][CURLOPT_CAINFO] = '/etc/ssl/cert.pem';
+            $args['sslcertificates'] = '/etc/ssl/cert.pem';
 
+            $args['headers']['Host'] = 'test.paytimum.com'; // Ensure Host header matches
+
+
+            // Force WordPress to use cURL
+            $args['transport'] = 'curl';
+            $args['curl'] = true;
+            $args['blocking'] = true;
+
+            // Verify proxy is used
             if ($this->config['debug_mode']) {
-                error_log("[SSH Tunnel] Routing request to {$url} through tunnel");
+                error_log("[SSH Tunnel] Request URL: " . $url);
+                error_log("[SSH Tunnel] CURL options: " . print_r($args, true));
+                $args['curl_setopt'][CURLOPT_VERBOSE] = true;
             }
         }
 
